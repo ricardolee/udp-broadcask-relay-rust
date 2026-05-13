@@ -1,0 +1,15 @@
+[package]
+name = "udp-broadcast-relay-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+pnet = "0.34"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+ipnet = "2.9"
+libc = "0.2"
+nix = { version = "0.27", features = ["socket", "net", "uio"] }
+socket2 = "0.5"
