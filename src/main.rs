@@ -6,7 +6,7 @@ use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Flags, Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::udp::{self, MutableUdpPacket, UdpPacket};
-use pnet::packet::Packet;
+use pnet::packet::{MutablePacket, Packet};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -46,7 +46,7 @@ struct Args {
     spoof: Option<Ipv4Addr>,
 
     /// Debug level (use multiple times for more detail)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     debug: u8,
 }
 
@@ -60,6 +60,7 @@ fn create_send_socket(iface_name: &str) -> Result<Socket> {
         .context("Failed to create raw socket")?;
     
     sock.set_nonblocking(true)?;
+    sock.set_broadcast(true)?;
     
     let optval: libc::c_int = 1;
     unsafe {
@@ -107,10 +108,6 @@ fn main() -> Result<()> {
         anyhow::bail!("ID must be between 1 and 63");
     }
 
-    if args.dev.len() < 2 {
-        anyhow::bail!("At least two interfaces must be specified with --dev");
-    }
-
     let all_interfaces = datalink::interfaces();
     let mut interfaces = HashMap::new();
 
@@ -124,6 +121,10 @@ fn main() -> Result<()> {
             iface: iface.clone(),
             send_sock,
         });
+    }
+
+    if interfaces.len() < 2 {
+        anyhow::bail!("At least two unique interfaces must be specified");
     }
 
     let interfaces = Arc::new(interfaces);
@@ -246,31 +247,32 @@ fn relay_packet(
 
     // IPv4 Header
     {
-        let mut ip_header = MutableIpv4Packet::new(&mut packet_buf[0..20]).unwrap();
+        let mut ip_header = MutableIpv4Packet::new(&mut packet_buf).unwrap();
         ip_header.set_version(4);
         ip_header.set_header_length(5);
         ip_header.set_dscp(dscp);
         ip_header.set_total_length(total_len as u16);
         ip_header.set_ttl(64);
         ip_header.set_next_level_protocol(IpNextHeaderProtocols::Udp);
-        ip_header.set_source(args.spoof.unwrap_or(src_ip));
+        let source_ip = args.spoof.unwrap_or(src_ip);
+        ip_header.set_source(source_ip);
         ip_header.set_destination(dst_ip);
         ip_header.set_flags(Ipv4Flags::DontFragment);
+
+        // UDP Header
+        {
+            let mut udp_header = MutableUdpPacket::new(ip_header.payload_mut()).unwrap();
+            udp_header.set_source(src_port);
+            udp_header.set_destination(args.port);
+            udp_header.set_length(8 + data.len() as u16);
+            udp_header.set_payload(data);
+
+            let checksum = udp::ipv4_checksum(&udp_header.to_immutable(), &source_ip, &dst_ip);
+            udp_header.set_checksum(checksum);
+        }
         
         let checksum = pnet::packet::ipv4::checksum(&ip_header.to_immutable());
         ip_header.set_checksum(checksum);
-    }
-
-    // UDP Header
-    {
-        let mut udp_header = MutableUdpPacket::new(&mut packet_buf[20..28]).unwrap();
-        udp_header.set_source(src_port);
-        udp_header.set_destination(args.port);
-        udp_header.set_length(8 + data.len() as u16);
-        udp_header.set_payload(data);
-
-        let checksum = udp::ipv4_checksum(&udp_header.to_immutable(), &args.spoof.unwrap_or(src_ip), &dst_ip);
-        udp_header.set_checksum(checksum);
     }
 
     let dest_addr = SocketAddrV4::new(dst_ip, args.port);

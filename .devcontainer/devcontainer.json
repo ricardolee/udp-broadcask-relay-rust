@@ -1,0 +1,22 @@
+{
+    "name": "UDP Broadcast Relay (Rust)",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "serayuzgur.crates"
+            ]
+        }
+    },
+    "remoteUser": "vscode",
+    "runArgs": [
+        "--cap-add=NET_ADMIN",
+        "--cap-add=NET_RAW"
+    ],
+    "postCreateCommand": "cargo build"
+}
