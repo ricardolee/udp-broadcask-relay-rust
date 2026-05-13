@@ -10,7 +10,6 @@ use pnet::packet::{MutablePacket, Packet};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
@@ -62,8 +61,11 @@ fn create_send_socket(iface_name: &str) -> Result<Socket> {
     sock.set_nonblocking(true)?;
     sock.set_broadcast(true)?;
     
+    // Set IP_HDRINCL so we can provide our own IP header.
+    // socket2 doesn't have a safe wrapper for this on all platforms yet.
     let optval: libc::c_int = 1;
     unsafe {
+        use std::os::unix::io::AsRawFd;
         if libc::setsockopt(
             sock.as_raw_fd(),
             libc::IPPROTO_IP,
@@ -77,18 +79,7 @@ fn create_send_socket(iface_name: &str) -> Result<Socket> {
     
     #[cfg(target_os = "linux")]
     {
-        let iface_bytes = iface_name.as_bytes();
-        unsafe {
-            if libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                iface_bytes.as_ptr() as *const libc::c_void,
-                iface_bytes.len() as libc::socklen_t,
-            ) != 0 {
-                anyhow::bail!("Failed to bind to device {}", iface_name);
-            }
-        }
+        sock.bind_device(Some(iface_name.as_bytes()))?;
     }
 
     Ok(sock)
