@@ -62,20 +62,7 @@ fn create_send_socket(iface_name: &str) -> Result<Socket> {
     sock.set_broadcast(true)?;
     
     // Set IP_HDRINCL so we can provide our own IP header.
-    // socket2 doesn't have a safe wrapper for this on all platforms yet.
-    let optval: libc::c_int = 1;
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        if libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_HDRINCL,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        ) != 0 {
-            anyhow::bail!("Failed to set IP_HDRINCL");
-        }
-    }
+    sock.set_header_included_v4(true)?;
     
     #[cfg(target_os = "linux")]
     {
