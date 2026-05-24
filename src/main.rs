@@ -55,7 +55,7 @@ struct InterfaceInfo {
 }
 
 fn create_send_socket(iface_name: &str) -> Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::from(libc::SOCK_RAW), Some(Protocol::from(255)))
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(255)))
         .context("Failed to create raw socket")?;
     
     sock.set_nonblocking(true)?;
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     let interfaces = Arc::new(interfaces);
 
     // Join multicast groups on a dummy socket to ensure the kernel receives them
-    let dummy_sock = Socket::new(Domain::IPV4, Type::from(libc::SOCK_DGRAM), Some(Protocol::from(libc::IPPROTO_UDP)))?;
+    let dummy_sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     for mc_addr in &args.multicast {
         for info in interfaces.values() {
             if let Some(ip) = info.iface.ips.iter().find(|ip| ip.is_ipv4()).map(|ip| ip.ip()) {
