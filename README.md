@@ -16,10 +16,10 @@ A Rust implementation of a UDP broadcast/multicast relay, inspired by [udpbroadc
 ## Usage
 ```bash
 # Relay mDNS (port 5353) between eth0 and eth1 with ID 1
-sudo ./target/release/udp-broadcast-relay-rust --id 1 --port 5353 --dev eth0 --dev eth1 --multicast 224.0.0.251
+sudo ./udp-broadcast-relay-rust --id 1 --port 5353 --dev eth0 --dev eth1 --multicast 224.0.0.251
 
 # Relay SSDP (port 1900)
-sudo ./target/release/udp-broadcast-relay-rust --id 2 --port 1900 --dev eth0 --dev eth1 --multicast 239.255.255.250
+sudo ./udp-broadcast-relay-rust --id 2 --port 1900 --dev eth0 --dev eth1 --multicast 239.255.255.250
 ```
 
 ## Command Line Arguments
