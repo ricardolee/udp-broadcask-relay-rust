@@ -38,14 +38,7 @@ jobs:
         run: |
           VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
           echo "Updating Cargo.toml version to: ${VERSION}"
-          python3 -c "
-          import re
-          with open('Cargo.toml', 'r') as f:
-              content = f.read()
-          new_content = re.sub(r'(?m)^version\s*=\s*\"[^\"]+\"', f'version = \"{VERSION}\"', content, count=1)
-          with open('Cargo.toml', 'w') as f:
-              f.write(new_content)
-          "
+          sed -i '0,/^version[[:space:]]*=/s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"$VERSION"'"/' Cargo.toml
           cat Cargo.toml
 
       - name: Install Rust toolchain
