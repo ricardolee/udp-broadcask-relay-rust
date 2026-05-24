@@ -34,6 +34,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Update version in Cargo.toml
+        run: |
+          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          echo "Updating Cargo.toml version to: ${VERSION}"
+          python3 -c "
+          import re
+          with open('Cargo.toml', 'r') as f:
+              content = f.read()
+          new_content = re.sub(r'(?m)^version\s*=\s*\"[^\"]+\"', f'version = \"{VERSION}\"', content, count=1)
+          with open('Cargo.toml', 'w') as f:
+              f.write(new_content)
+          "
+          cat Cargo.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
