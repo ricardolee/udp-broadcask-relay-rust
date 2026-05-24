@@ -5,8 +5,11 @@ set -ex
 # Ensure we are in the project root
 cd "$(dirname "$0")/.."
 
-echo "Building project..."
-cargo build
+if [ -z "$SKIP_BUILD" ]; then
+    echo "Building project..."
+    cargo build
+fi
+
 
 echo "Setting up network interfaces in unshared namespace..."
 # Note: If running inside a container with CAP_NET_ADMIN, we can just use 'ip' directly.
