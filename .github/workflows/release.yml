@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-release:
-    name: Build - ${{ matrix.target }}
+    name: Build - ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -19,16 +19,22 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             use_cross: false
+            arch: linux-amd64
           - target: x86_64-unknown-linux-musl
             use_cross: true
+            arch: linux-amd64-musl
           - target: aarch64-unknown-linux-gnu
             use_cross: true
+            arch: linux-arm64
           - target: aarch64-unknown-linux-musl
             use_cross: true
+            arch: linux-arm64-musl
           - target: armv7-unknown-linux-gnueabihf
             use_cross: true
+            arch: linux-armv7
           - target: armv7-unknown-linux-musleabihf
             use_cross: true
+            arch: linux-armv7-musl
 
     steps:
       - name: Checkout repository
@@ -68,7 +74,7 @@ jobs:
         run: |
           BINARY_NAME="udp-broadcast-relay-rust"
           TARGET_DIR="target/${{ matrix.target }}/release"
-          ARCHIVE_NAME="${BINARY_NAME}-${{ matrix.target }}.tar.gz"
+          ARCHIVE_NAME="${BINARY_NAME}-${{ matrix.arch }}.tar.gz"
           
           # Create temporary packaging directory
           PKG_DIR=$(mktemp -d)
@@ -91,7 +97,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            udp-broadcast-relay-rust-${{ matrix.target }}.tar.gz
-            udp-broadcast-relay-rust-${{ matrix.target }}.tar.gz.sha256
+            udp-broadcast-relay-rust-${{ matrix.arch }}.tar.gz
+            udp-broadcast-relay-rust-${{ matrix.arch }}.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
