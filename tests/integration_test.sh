@@ -5,17 +5,19 @@ set -ex
 # Ensure we are in the project root
 cd "$(dirname "$0")/.."
 
-if [ -z "$SKIP_BUILD" ]; then
-    echo "Building project..."
-    cargo build
-fi
 
+# Define test runner
+run_tests() {
+    # Create temporary directory for test logs and outputs
+    TEST_DIR=$(mktemp -d /tmp/udp-broadcast-relay-tests.XXXXXX)
+    echo "Temporary test directory created: $TEST_DIR"
 
-echo "Setting up network interfaces in unshared namespace..."
-# Note: If running inside a container with CAP_NET_ADMIN, we can just use 'ip' directly.
-# If running on host, we use 'unshare -rn' to avoid root requirements.
+    # Make case files executable
+    chmod +x tests/cases/*.sh
 
-run_test() {
+    # ----------------------------------------------------
+    # Setup Virtual Ethernet Pairs & Networking
+    # ----------------------------------------------------
     echo "Setting up veth pairs..."
     ip link add veth1 type veth peer name veth1-peer
     ip link add veth2 type veth peer name veth2-peer
@@ -31,105 +33,54 @@ run_test() {
     ip addr add 192.168.20.1/24 dev veth2
     ip addr add 192.168.20.2/24 dev veth2-peer
 
-    echo "Starting relay..."
-    ./target/debug/udp-broadcast-relay-rust --id 1 --port 5555 --dev veth1 --dev veth2 -vv > relay.log 2>&1 &
-    RELAY_PID=$!
-    sleep 2
+    # Manually populate ARP table inside the namespace to bypass ARP resolution failure between virtual ethernet peers
+    MAC_VETH1=$(ip link show veth1 | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n 1)
+    MAC_VETH1_PEER=$(ip link show veth1-peer | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n 1)
+    MAC_VETH2=$(ip link show veth2 | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n 1)
+    MAC_VETH2_PEER=$(ip link show veth2-peer | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n 1)
 
-    if ! kill -0 $RELAY_PID; then
-        echo "Relay failed to start. Log:"
-        cat relay.log
-        exit 1
-    fi
+    ip neigh add 192.168.10.2 lladdr $MAC_VETH1_PEER dev veth1 || true
+    ip neigh add 192.168.10.1 lladdr $MAC_VETH1 dev veth1-peer || true
+    ip neigh add 192.168.20.2 lladdr $MAC_VETH2_PEER dev veth2 || true
+    ip neigh add 192.168.20.1 lladdr $MAC_VETH2 dev veth2-peer || true
 
-    echo "Testing broadcast relay..."
-    rm -f received.txt
-    # Listen on 0.0.0.0 because the relayed packet might be seen as broadcast on the target interface
-    python3 -c '
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("0.0.0.0", 5555))
-s.settimeout(5)
-try:
-    data, addr = s.recvfrom(1024)
-    print(f"Received from {addr}")
-    with open("received.txt", "wb") as f:
-        f.write(data)
-except socket.timeout:
-    print("Timeout waiting for packet")
-' &
-    PY_LISTEN_PID=$!
-    sleep 1
+    # Disable Reverse Path Filtering (rp_filter) inside the namespace
+    # to allow Standard UDP sockets to receive packets with virtual peer IPs.
+    echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter || true
+    echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter || true
+    echo 0 > /proc/sys/net/ipv4/conf/veth1/rp_filter || true
+    echo 0 > /proc/sys/net/ipv4/conf/veth1-peer/rp_filter || true
+    echo 0 > /proc/sys/net/ipv4/conf/veth2/rp_filter || true
+    echo 0 > /proc/sys/net/ipv4/conf/veth2-peer/rp_filter || true
 
-    python3 -c '
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-s.bind(("192.168.10.2", 0))
-s.sendto(b"HELLO-INTEGRATION", ("255.255.255.255", 5555))
-'
-    wait $PY_LISTEN_PID || true
+    # Enable accept_local to allow unicast packets with local source IPs between veth interfaces in the same namespace
+    echo 1 > /proc/sys/net/ipv4/conf/all/accept_local || true
+    echo 1 > /proc/sys/net/ipv4/conf/default/accept_local || true
+    echo 1 > /proc/sys/net/ipv4/conf/veth1/accept_local || true
+    echo 1 > /proc/sys/net/ipv4/conf/veth1-peer/accept_local || true
+    echo 1 > /proc/sys/net/ipv4/conf/veth2/accept_local || true
+    echo 1 > /proc/sys/net/ipv4/conf/veth2-peer/accept_local || true
 
-    if [ -f received.txt ] && grep -q "HELLO-INTEGRATION" received.txt; then
-        echo "SUCCESS: Broadcast packet relayed!"
-    else
-        echo "FAILURE: Broadcast packet NOT relayed."
-        echo "Relay log:"
-        cat relay.log
-        # If the log shows "Sending packet out of veth2", the relay did its job.
-        # The network stack in unshare might be tricky with raw sockets and veth.
-        if grep -q "Sending packet out of veth2" relay.log; then
-            echo "Relay confirmed sending packet, but listener did not receive it."
-            echo "This might be due to unprivileged unshare network limitations."
-            echo "Since the relay logic is verified by the logs, we will consider it a partial success."
-        fi
-        exit 1
-    fi
+    # Enable routing/forwarding inside the namespace
+    echo 1 > /proc/sys/net/ipv4/ip_forward || true
 
-    echo "Testing loop prevention..."
-    rm -f loop_received.txt
-    python3 -c '
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("192.168.20.2", 5555))
-s.settimeout(2)
-try:
-    data, addr = s.recvfrom(1024)
-    with open("loop_received.txt", "wb") as f:
-        f.write(data)
-except socket.timeout:
-    pass
-' &
-    PY_LP_PID=$!
-    sleep 1
+    # Execute modular test case scripts
+    ./tests/cases/case_1_spoofing.sh "$TEST_DIR"
+    ./tests/cases/case_2_cidr_acl.sh "$TEST_DIR"
+    ./tests/cases/case_3_ttl_loop.sh "$TEST_DIR"
+    ./tests/cases/case_4_ssdp_dial.sh "$TEST_DIR"
 
-    python3 -c '
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-s.setsockopt(socket.SOL_IP, socket.IP_TOS, 1 << 2)
-s.bind(("192.168.10.2", 0))
-s.sendto(b"LOOP-TEST", ("255.255.255.255", 5555))
-'
-    sleep 2
-    # kill $LP_NC_PID || true # No longer needed as python script exits on timeout
-    
-    if [ -s loop_received.txt ]; then
-        echo "FAILURE: Packet with DSCP 1 was relayed!"
-        exit 1
-    else
-        echo "SUCCESS: Loop prevention worked."
-    fi
-
-    kill $RELAY_PID || true
-    echo "All tests passed!"
-    # Cleanup temporary files
-    rm -f received.txt loop_received.txt relay.log
+    # Cleanup temporary files and interfaces
+    echo "Cleaning up..."
+    rm -rf "$TEST_DIR"
+    ip link del veth1 || true
+    ip link del veth2 || true
+    echo "ALL TESTS PASSED!"
 }
 
 # Export the function so unshare can see it, or just run the commands
 if [ "$1" == "--inside-ns" ]; then
-    run_test
+    run_tests
 else
     unshare -rn "$0" --inside-ns
 fi
