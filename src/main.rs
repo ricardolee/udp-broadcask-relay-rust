@@ -12,8 +12,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Unique instance ID offset for TTL-based loop prevention.
@@ -120,6 +119,25 @@ struct TcpProxyListenerInfo {
     last_active: Instant,
 }
 
+struct TcpProxyConnection {
+    client: TcpStream,
+    server: TcpStream,
+    client_fd: RawFd,
+    server_fd: RawFd,
+    target_addr: SocketAddrV4,
+    client_facing_ip: Ipv4Addr,
+    last_active: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FdRole {
+    MainUdp,
+    MsearchProxy { port: u16 },
+    TcpListener { port: u16 },
+    TcpClient { conn_index: usize },
+    TcpServer { conn_index: usize },
+}
+
 /// Creates a raw socket bound to a specific network interface.
 fn create_send_socket(iface_name: &str) -> Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(255)))
@@ -132,6 +150,30 @@ fn create_send_socket(iface_name: &str) -> Result<Socket> {
     #[cfg(target_os = "linux")]
     {
         sock.bind_device(Some(iface_name.as_bytes()))?;
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let all_interfaces = datalink::interfaces();
+        let iface = all_interfaces
+            .iter()
+            .find(|i| i.name == iface_name)
+            .with_context(|| format!("Interface {} not found", iface_name))?;
+
+        let iface_ip = iface
+            .ips
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .map(|ip| ip.ip())
+            .with_context(|| format!("No IPv4 address on interface {}", iface_name))?;
+
+        if let IpAddr::V4(v4_addr) = iface_ip {
+            let bind_addr = SocketAddrV4::new(v4_addr, 0);
+            sock.bind(&bind_addr.into())
+                .context("Failed to bind raw socket to interface IP on FreeBSD")?;
+            sock.set_multicast_if_v4(&v4_addr)
+                .context("Failed to set IP_MULTICAST_IF on FreeBSD")?;
+        }
     }
 
     Ok(sock)
@@ -305,15 +347,43 @@ fn create_rcv_socket(port: u16) -> Result<Socket> {
     unsafe {
         let yes: libc::c_int = 1;
 
-        if libc::setsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::IP_PKTINFO,
-            &yes as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        ) < 0
+        #[cfg(target_os = "linux")]
         {
-            return Err(anyhow!("Failed to set IP_PKTINFO"));
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                libc::IP_PKTINFO,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) < 0
+            {
+                return Err(anyhow!("Failed to set IP_PKTINFO"));
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_RECVIF,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) < 0
+            {
+                return Err(anyhow!("Failed to set IP_RECVIF"));
+            }
+
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_RECVDSTADDR,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) < 0
+            {
+                return Err(anyhow!("Failed to set IP_RECVDSTADDR"));
+            }
         }
 
         if libc::setsockopt(
@@ -390,18 +460,33 @@ fn recv_with_ancillary(fd: RawFd, buf: &mut [u8]) -> Result<Option<RecvMsgResult
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_IP {
+            if (*cmsg).cmsg_level == libc::SOL_IP || (*cmsg).cmsg_level == libc::IPPROTO_IP {
                 if (*cmsg).cmsg_type == libc::IP_TTL {
                     let ptr = libc::CMSG_DATA(cmsg) as *const libc::c_int;
                     ttl = *ptr as u8;
                 } else if (*cmsg).cmsg_type == libc::IP_TOS {
                     let ptr = libc::CMSG_DATA(cmsg) as *const libc::c_int;
                     tos = *ptr as u8;
-                } else if (*cmsg).cmsg_type == libc::IP_PKTINFO {
-                    let ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
-                    let pktinfo = *ptr;
-                    ifindex = pktinfo.ipi_ifindex as u32;
-                    dst_ip = Ipv4Addr::from(u32::from_be(pktinfo.ipi_addr.s_addr));
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if (*cmsg).cmsg_type == libc::IP_PKTINFO {
+                            let ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
+                            let pktinfo = *ptr;
+                            ifindex = pktinfo.ipi_ifindex as u32;
+                            dst_ip = Ipv4Addr::from(u32::from_be(pktinfo.ipi_addr.s_addr));
+                        }
+                    }
+                    #[cfg(target_os = "freebsd")]
+                    {
+                        if (*cmsg).cmsg_type == libc::IP_RECVIF {
+                            let sdl = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_dl);
+                            ifindex = sdl.sdl_index as u32;
+                        } else if (*cmsg).cmsg_type == libc::IP_RECVDSTADDR {
+                            let in_addr = &*(libc::CMSG_DATA(cmsg) as *const libc::in_addr);
+                            dst_ip = Ipv4Addr::from(u32::from_be(in_addr.s_addr));
+                        }
+                    }
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
@@ -472,170 +557,7 @@ fn extract_ip_port_from_header(payload: &[u8], header_name: &str) -> Option<(Ipv
     None
 }
 
-fn handle_tcp_proxy(
-    mut client: TcpStream,
-    target_addr: SocketAddrV4,
-    client_facing_ip: Ipv4Addr,
-    rest_proxies: Arc<Mutex<HashMap<u16, TcpProxyListenerInfo>>>,
-) {
-    let mut server = match TcpStream::connect(target_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!(
-                "TCP proxy failed to connect to target {}: {}",
-                target_addr,
-                e
-            );
-            return;
-        }
-    };
 
-    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = server.set_read_timeout(Some(Duration::from_secs(10)));
-
-    let mut client_clone = client.try_clone().unwrap();
-    let mut server_clone = server.try_clone().unwrap();
-
-    // Thread 1: Client to Server (Rewrite Host header)
-    let c2s = thread::spawn(move || {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            let n = match client_clone.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            // Rewrite Host header if HTTP request
-            let rewritten = replace_header_value(
-                &buf[..n],
-                "Host",
-                &format!("{}:{}", target_addr.ip(), target_addr.port()),
-            );
-            if server_clone.write_all(&rewritten).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Thread 2: Server to Client (Rewrite Application-URL / Location headers)
-    let s2c = thread::spawn(move || {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            let n = match server.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-
-            let mut rewritten = buf[..n].to_vec();
-
-            // Check for Application-URL header
-            if let Some((app_ip, app_port)) =
-                extract_ip_port_from_header(&rewritten, "Application-URL")
-            {
-                // Find or create dynamic REST proxy
-                let mut proxies = rest_proxies.lock().unwrap();
-                let existing = proxies.values().find(|p| {
-                    p.target_addr == SocketAddrV4::new(app_ip, app_port)
-                        && p.client_facing_ip == client_facing_ip
-                });
-
-                let port = if let Some(p) = existing {
-                    p.listener.local_addr().unwrap().port()
-                } else {
-                    match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0)) {
-                        Ok(listener) => {
-                            let local_port = listener.local_addr().unwrap().port();
-                            listener.set_nonblocking(true).unwrap();
-                            proxies.insert(
-                                local_port,
-                                TcpProxyListenerInfo {
-                                    listener,
-                                    target_addr: SocketAddrV4::new(app_ip, app_port),
-                                    client_facing_ip,
-                                    last_active: Instant::now(),
-                                },
-                            );
-                            log::info!(
-                                "Created dynamic REST TCP proxy on port {} for target {}:{}",
-                                local_port,
-                                app_ip,
-                                app_port
-                            );
-                            local_port
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to create REST TCP proxy: {}", e);
-                            0
-                        }
-                    }
-                };
-
-                if port != 0 {
-                    rewritten = replace_header_value(
-                        &rewritten,
-                        "Application-URL",
-                        &format!("http://{}:{}/apps/", client_facing_ip, port),
-                    );
-                }
-            }
-
-            // Check for Location header
-            if let Some((loc_ip, loc_port)) = extract_ip_port_from_header(&rewritten, "Location") {
-                // Find or create dynamic Location proxy
-                let mut proxies = rest_proxies.lock().unwrap();
-                let existing = proxies.values().find(|p| {
-                    p.target_addr == SocketAddrV4::new(loc_ip, loc_port)
-                        && p.client_facing_ip == client_facing_ip
-                });
-
-                let port = if let Some(p) = existing {
-                    p.listener.local_addr().unwrap().port()
-                } else {
-                    match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0)) {
-                        Ok(listener) => {
-                            let local_port = listener.local_addr().unwrap().port();
-                            listener.set_nonblocking(true).unwrap();
-                            proxies.insert(
-                                local_port,
-                                TcpProxyListenerInfo {
-                                    listener,
-                                    target_addr: SocketAddrV4::new(loc_ip, loc_port),
-                                    client_facing_ip,
-                                    last_active: Instant::now(),
-                                },
-                            );
-                            log::info!(
-                                "Created dynamic REST TCP proxy on port {} for target {}:{}",
-                                local_port,
-                                loc_ip,
-                                loc_port
-                            );
-                            local_port
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to create REST TCP proxy: {}", e);
-                            0
-                        }
-                    }
-                };
-
-                if port != 0 {
-                    rewritten = replace_header_value(
-                        &rewritten,
-                        "Location",
-                        &format!("http://{}:{}/", client_facing_ip, port),
-                    );
-                }
-            }
-
-            if client.write_all(&rewritten).is_err() {
-                break;
-            }
-        }
-    });
-
-    let _ = c2s.join();
-    let _ = s2c.join();
-}
 
 fn main() -> Result<()> {
     let args = Arc::new(Args::parse());
@@ -814,404 +736,643 @@ fn main() -> Result<()> {
     }
 
     // Map to hold dynamic M-SEARCH proxies
-    let msearch_proxies: Arc<Mutex<HashMap<u16, MsearchProxyInfo>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let mut msearch_proxies: HashMap<u16, MsearchProxyInfo> = HashMap::new();
     // Map to hold dynamic TCP REST/DIAL proxies
-    let tcp_proxies: Arc<Mutex<HashMap<u16, TcpProxyListenerInfo>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Spawn a Garbage Collector background thread to expire idle proxies
-    let run_gc = Arc::clone(&running);
-    let m_proxies_gc = Arc::clone(&msearch_proxies);
-    let t_proxies_gc = Arc::clone(&tcp_proxies);
-    thread::spawn(move || {
-        while run_gc.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_secs(5));
-            let now = Instant::now();
-
-            // Clean UDP M-SEARCH proxies (expire after 60s)
-            {
-                let mut proxies = m_proxies_gc.lock().unwrap();
-                proxies.retain(|&port, p| {
-                    if now.duration_since(p.last_active) > Duration::from_secs(60) {
-                        log::info!("Expiring M-SEARCH proxy on port {}", port);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-
-            // Clean TCP REST proxies (expire after 120s)
-            {
-                let mut proxies = t_proxies_gc.lock().unwrap();
-                proxies.retain(|&port, p| {
-                    if now.duration_since(p.last_active) > Duration::from_secs(120) {
-                        log::info!("Expiring REST TCP proxy on port {}", port);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-    });
+    let mut tcp_proxies: HashMap<u16, TcpProxyListenerInfo> = HashMap::new();
 
     let mut buf = vec![0u8; 65536];
+    let mut active_tcp_connections: Vec<TcpProxyConnection> = Vec::new();
+    let mut last_gc_time = Instant::now();
 
     while running.load(Ordering::SeqCst) {
-        // Read incoming UDP packets from the main socket
-        let res = match recv_with_ancillary(main_fd, &mut buf) {
-            Ok(Some(r)) => {
-                log::debug!(
-                    "Received UDP packet: len={}, src={}, dst={}, ifindex={}",
-                    r.len,
-                    r.src_addr,
-                    r.dst_ip,
-                    r.ifindex
-                );
-                r
+        // Inline Garbage Collector (runs every 5 seconds)
+        let now = Instant::now();
+        if now.duration_since(last_gc_time) >= Duration::from_secs(5) {
+            last_gc_time = now;
+
+            // Clean UDP M-SEARCH proxies (expire after 60s)
+            msearch_proxies.retain(|&port, p| {
+                if now.duration_since(p.last_active) > Duration::from_secs(60) {
+                    log::info!("Expiring M-SEARCH proxy on port {}", port);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Clean TCP REST proxies (expire after 120s)
+            tcp_proxies.retain(|&port, p| {
+                if now.duration_since(p.last_active) > Duration::from_secs(120) {
+                    log::info!("Expiring REST TCP proxy on port {}", port);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Clean inactive active TCP proxy connections (expire after 120s)
+            active_tcp_connections.retain(|conn| {
+                if now.duration_since(conn.last_active) > Duration::from_secs(120) {
+                    log::info!("Expiring active TCP proxy connection due to inactivity");
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // Build pollfd array
+        let mut poll_fds = Vec::new();
+        let mut fd_roles = Vec::new();
+
+        // 1. Main receive UDP socket
+        poll_fds.push(libc::pollfd {
+            fd: main_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        fd_roles.push(FdRole::MainUdp);
+
+        // 2. Active UDP M-SEARCH proxy sockets
+        for (&port, p) in &msearch_proxies {
+            poll_fds.push(libc::pollfd {
+                fd: p.sock.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fd_roles.push(FdRole::MsearchProxy { port });
+        }
+
+        // 3. Dynamic TCP listeners
+        for (&port, p) in &tcp_proxies {
+            poll_fds.push(libc::pollfd {
+                fd: p.listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fd_roles.push(FdRole::TcpListener { port });
+        }
+
+        // 4. Active TCP proxy connections
+        for (idx, conn) in active_tcp_connections.iter().enumerate() {
+            poll_fds.push(libc::pollfd {
+                fd: conn.client_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fd_roles.push(FdRole::TcpClient { conn_index: idx });
+
+            poll_fds.push(libc::pollfd {
+                fd: conn.server_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fd_roles.push(FdRole::TcpServer { conn_index: idx });
+        }
+
+        // Call poll with a 1-second timeout (to allow periodic inline GC execution)
+        let ret = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as libc::nfds_t,
+                1000,
+            )
+        };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                log::error!("poll failed: {}", err);
             }
-            Ok(None) => {
-                thread::sleep(Duration::from_millis(5));
+            continue;
+        }
 
-                // Let's accept connections on our dynamic TCP listeners too!
-                let mut active_tcp_listeners = Vec::new();
-                {
-                    let proxies = tcp_proxies.lock().unwrap();
-                    for (&port, p) in proxies.iter() {
-                        active_tcp_listeners.push((port, p.target_addr, p.client_facing_ip));
+        if ret == 0 {
+            // Timeout reached, loop will perform GC and rebuild poll_fds
+            continue;
+        }
+
+        let mut closed_connections = std::collections::HashSet::new();
+
+        // Process active events
+        for i in 0..poll_fds.len() {
+            let revents = poll_fds[i].revents;
+            if revents == 0 {
+                continue;
+            }
+
+            // If error/hangup on a TCP proxy socket, close it
+            if (revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 && (revents & libc::POLLIN) == 0 {
+                match fd_roles[i] {
+                    FdRole::TcpClient { conn_index } | FdRole::TcpServer { conn_index } => {
+                        closed_connections.insert(conn_index);
                     }
+                    _ => {}
                 }
+                continue;
+            }
 
-                for (port, target_addr, client_facing_ip) in active_tcp_listeners {
-                    let listener = {
-                        let proxies = tcp_proxies.lock().unwrap();
-                        proxies.get(&port).map(|p| p.listener.try_clone().unwrap())
-                    };
-
-                    if let Some(l) = listener {
-                        if let Ok((client_stream, _)) = l.accept() {
-                            log::info!(
-                                "TCP proxy accepted connection on port {} targeting {}",
-                                port,
-                                target_addr
-                            );
-                            // Update last active
-                            if let Some(p) = tcp_proxies.lock().unwrap().get_mut(&port) {
-                                p.last_active = Instant::now();
-                            }
-                            let rest_proxies_clone = Arc::clone(&tcp_proxies);
-                            thread::spawn(move || {
-                                handle_tcp_proxy(
-                                    client_stream,
-                                    target_addr,
-                                    client_facing_ip,
-                                    rest_proxies_clone,
+            if (revents & libc::POLLIN) != 0 {
+                match fd_roles[i] {
+                    FdRole::MainUdp => {
+                        // Read incoming UDP packets from the main socket
+                        let res = match recv_with_ancillary(main_fd, &mut buf) {
+                            Ok(Some(r)) => {
+                                log::debug!(
+                                    "Received UDP packet: len={}, src={}, dst={}, ifindex={}",
+                                    r.len,
+                                    r.src_addr,
+                                    r.dst_ip,
+                                    r.ifindex
                                 );
-                            });
-                        }
-                    }
-                }
-
-                // Check dynamic UDP proxy responses
-                let mut active_udp_sockets = Vec::new();
-                {
-                    let proxies = msearch_proxies.lock().unwrap();
-                    for (&port, p) in proxies.iter() {
-                        active_udp_sockets.push((
-                            port,
-                            p.sock.try_clone().unwrap(),
-                            p.client_addr,
-                            p.src_ifindex,
-                            p.action.clone(),
-                        ));
-                    }
-                }
-
-                for (port, sock, client_addr, src_ifindex, action) in active_udp_sockets {
-                    let mut ubuf = vec![0u8; 8192];
-                    if let Ok((n, _)) = sock.recv_from(&mut ubuf) {
-                        // We received a unicast response from an SSDP server!
-                        // Update active timestamp
-                        if let Some(p) = msearch_proxies.lock().unwrap().get_mut(&port) {
-                            p.last_active = Instant::now();
-                        }
-
-                        let client_facing_ip = {
-                            let iface_info = interfaces.get(&src_ifindex).unwrap();
-                            let ip = iface_info
-                                .iface
-                                .ips
-                                .iter()
-                                .find(|ip| ip.is_ipv4())
-                                .unwrap()
-                                .ip();
-                            match ip {
-                                IpAddr::V4(v4) => v4,
-                                _ => continue,
+                                r
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                log::error!("Error receiving: {}", e);
+                                continue;
                             }
                         };
 
-                        let mut rewritten = ubuf[..n].to_vec();
+                        // Loop Prevention check
+                        let rx_id = if args.ttl_id {
+                            res.ttl.saturating_sub(TTL_ID_OFFSET)
+                        } else {
+                            res.tos >> 2
+                        };
 
-                        if action == MsearchAction::Dial {
-                            // Extract Location
-                            if let Some((srv_ip, srv_port)) =
-                                extract_ip_port_from_header(&rewritten, "Location")
-                            {
-                                // Find or create dynamic TCP proxy listener
-                                let mut proxies = tcp_proxies.lock().unwrap();
-                                let existing = proxies.values().find(|p| {
-                                    p.target_addr == SocketAddrV4::new(srv_ip, srv_port)
-                                        && p.client_facing_ip == client_facing_ip
-                                });
+                        if args.ttl_id {
+                            if res.ttl == args.id + TTL_ID_OFFSET {
+                                log::trace!("TTL loop prevented: rx_ttl = {}, ID = {}", res.ttl, args.id);
+                                continue;
+                            }
+                        } else {
+                            if rx_id == args.id {
+                                log::trace!(
+                                    "DSCP loop prevented: rx_tos DSCP = {}, ID = {}",
+                                    rx_id,
+                                    args.id
+                                );
+                                continue;
+                            }
+                        }
 
-                                let tcp_port = if let Some(p) = existing {
-                                    p.listener.local_addr().unwrap().port()
-                                } else {
-                                    match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0))
-                                    {
-                                        Ok(listener) => {
-                                            let local_port = listener.local_addr().unwrap().port();
-                                            listener.set_nonblocking(true).unwrap();
-                                            proxies.insert(
-                                                local_port,
-                                                TcpProxyListenerInfo {
-                                                    listener,
-                                                    target_addr: SocketAddrV4::new(
-                                                        srv_ip, srv_port,
-                                                    ),
-                                                    client_facing_ip,
-                                                    last_active: Instant::now(),
-                                                },
-                                            );
-                                            log::info!("Created Location TCP proxy on port {} for target {}:{}", local_port, srv_ip, srv_port);
-                                            local_port
+                        // blockid check
+                        if args.blockid.contains(&rx_id) {
+                            log::trace!(
+                                "BlockID loop prevented: rx_id = {}, blocked IDs = {:?}",
+                                rx_id,
+                                args.blockid
+                            );
+                            continue;
+                        }
+
+                        // Check if from managed interface
+                        if !interfaces.contains_key(&res.ifindex) {
+                            continue;
+                        }
+
+                        // Apply CIDR network filter rules
+                        if !check_cidr_acl(
+                            &acl_rules,
+                            default_acl_action.clone(),
+                            *res.src_addr.ip(),
+                        ) {
+                            log::trace!("Packet from {} blocked by CIDR ACL", res.src_addr.ip());
+                            continue;
+                        }
+
+                        // Check for SSDP M-SEARCH requests
+                        let mut is_msearch = false;
+                        let mut msearch_act = MsearchAction::Forward;
+                        let payload = &buf[..res.len];
+
+                        if payload.starts_with(b"M-SEARCH * HTTP/1.1\r\n") {
+                            is_msearch = true;
+                            // Parse ST (Search Target)
+                            let text = String::from_utf8_lossy(payload);
+                            let mut matched_filter = None;
+                            for line in text.split("\r\n") {
+                                if line.to_ascii_lowercase().starts_with("st:") {
+                                    let st_val = line.splitn(2, ':').nth(1).unwrap_or("").trim();
+                                    matched_filter = msearch_filters.iter().find(|f| f.search_string == st_val);
+                                    break;
+                                }
+                            }
+
+                            msearch_act = if let Some(filter) = matched_filter {
+                                filter.action.clone()
+                            } else {
+                                default_msearch_action.clone()
+                            };
+                            log::debug!("SSDP M-SEARCH query matched action: {:?}", msearch_act);
+                        }
+
+                        if is_msearch {
+                            match msearch_act {
+                                MsearchAction::Block => continue,
+                                MsearchAction::Forward => {
+                                    // Relay as normal UDP packet
+                                    let _ = relay_packet(
+                                        &args,
+                                        &interfaces,
+                                        res.ifindex,
+                                        None,
+                                        *res.src_addr.ip(),
+                                        res.src_addr.port(),
+                                        res.dst_ip,
+                                        args.port,
+                                        res.ttl,
+                                        res.tos,
+                                        payload,
+                                    );
+                                }
+                                MsearchAction::Proxy | MsearchAction::Dial => {
+                                    // SSDP proxy logic
+                                    let existing_port = msearch_proxies
+                                        .iter()
+                                        .find(|(_, p)| {
+                                            p.client_addr == res.src_addr && p.src_ifindex == res.ifindex
+                                        })
+                                        .map(|(&port, _)| port);
+
+                                    let proxy_port = if let Some(port) = existing_port {
+                                        if let Some(p) = msearch_proxies.get_mut(&port) {
+                                            p.last_active = Instant::now();
                                         }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "Failed to create Location TCP proxy: {}",
-                                                e
-                                            );
-                                            0
+                                        port
+                                    } else {
+                                        // Create dynamic UDP proxy socket
+                                        match UdpSocket::bind("0.0.0.0:0") {
+                                            Ok(sock) => {
+                                                sock.set_nonblocking(true).unwrap();
+                                                let port = sock.local_addr().unwrap().port();
+                                                msearch_proxies.insert(
+                                                    port,
+                                                    MsearchProxyInfo {
+                                                        sock,
+                                                        client_addr: res.src_addr,
+                                                        src_ifindex: res.ifindex,
+                                                        action: msearch_act.clone(),
+                                                        last_active: Instant::now(),
+                                                    },
+                                                );
+                                                log::info!(
+                                                    "Created dynamic SSDP proxy on port {} for client {}",
+                                                    port,
+                                                    res.src_addr
+                                                );
+                                                port
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to create dynamic SSDP proxy: {}", e);
+                                                0
+                                            }
+                                        }
+                                    };
+
+                                    if proxy_port != 0 {
+                                        // Forward M-SEARCH query through target interfaces with rewritten source port
+                                        let _ = relay_packet(
+                                            &args,
+                                            &interfaces,
+                                            res.ifindex,
+                                            None,
+                                            *res.src_addr.ip(),
+                                            proxy_port,
+                                            res.dst_ip,
+                                            args.port,
+                                            res.ttl,
+                                            res.tos,
+                                            payload,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Relaying normal UDP packet
+                            let _ = relay_packet(
+                                &args,
+                                &interfaces,
+                                res.ifindex,
+                                None,
+                                *res.src_addr.ip(),
+                                res.src_addr.port(),
+                                res.dst_ip,
+                                args.port,
+                                res.ttl,
+                                res.tos,
+                                payload,
+                            );
+                        }
+                    }
+                    FdRole::MsearchProxy { port } => {
+                        if let Some(p) = msearch_proxies.get_mut(&port) {
+                            let mut ubuf = vec![0u8; 8192];
+                            match p.sock.recv_from(&mut ubuf) {
+                                Ok((n, _)) => {
+                                    p.last_active = Instant::now();
+
+                                    let client_facing_ip = {
+                                        let iface_info = interfaces.get(&p.src_ifindex).unwrap();
+                                        let ip = iface_info
+                                            .iface
+                                            .ips
+                                            .iter()
+                                            .find(|ip| ip.is_ipv4())
+                                            .unwrap()
+                                            .ip();
+                                        match ip {
+                                            IpAddr::V4(v4) => v4,
+                                            _ => continue,
+                                        }
+                                    };
+
+                                    let mut rewritten = ubuf[..n].to_vec();
+
+                                    if p.action == MsearchAction::Dial {
+                                        if let Some((srv_ip, srv_port)) =
+                                            extract_ip_port_from_header(&rewritten, "Location")
+                                        {
+                                            let existing = tcp_proxies.values().find(|proxy| {
+                                                proxy.target_addr == SocketAddrV4::new(srv_ip, srv_port)
+                                                    && proxy.client_facing_ip == client_facing_ip
+                                            });
+
+                                            let tcp_port = if let Some(proxy) = existing {
+                                                proxy.listener.local_addr().unwrap().port()
+                                            } else {
+                                                match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0)) {
+                                                    Ok(listener) => {
+                                                        let local_port = listener.local_addr().unwrap().port();
+                                                        listener.set_nonblocking(true).unwrap();
+                                                        tcp_proxies.insert(
+                                                            local_port,
+                                                            TcpProxyListenerInfo {
+                                                                listener,
+                                                                target_addr: SocketAddrV4::new(srv_ip, srv_port),
+                                                                client_facing_ip,
+                                                                last_active: Instant::now(),
+                                                            },
+                                                        );
+                                                        log::info!(
+                                                            "Created Location TCP proxy on port {} for target {}:{}",
+                                                            local_port,
+                                                            srv_ip,
+                                                            srv_port
+                                                        );
+                                                        local_port
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!("Failed to create Location TCP proxy: {}", e);
+                                                        0
+                                                    }
+                                                }
+                                            };
+
+                                            if tcp_port != 0 {
+                                                rewritten = replace_header_value(
+                                                    &rewritten,
+                                                    "Location",
+                                                    &format!("http://{}:{}/dd.xml", client_facing_ip, tcp_port),
+                                                );
+                                            }
                                         }
                                     }
-                                };
 
-                                if tcp_port != 0 {
-                                    rewritten = replace_header_value(
-                                        &rewritten,
-                                        "Location",
-                                        &format!("http://{}:{}/dd.xml", client_facing_ip, tcp_port),
+                                    // Relay SSDP reply back to original client
+                                    let data_str = String::from_utf8_lossy(&rewritten);
+                                    log::debug!(
+                                        "SSDP Relay Response to client {}: \n{}",
+                                        p.client_addr,
+                                        data_str
                                     );
+
+                                    let _ = relay_packet(
+                                        &args,
+                                        &interfaces,
+                                        0,
+                                        Some(p.src_ifindex),
+                                        client_facing_ip,
+                                        port,
+                                        *p.client_addr.ip(),
+                                        p.client_addr.port(),
+                                        TTL_ID_OFFSET,
+                                        0,
+                                        &rewritten,
+                                    );
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(e) => {
+                                    log::warn!("Dynamic UDP proxy recv failed on port {}: {}", port, e);
                                 }
                             }
                         }
-
-                        // Relay SSDP reply back to original client
-                        let data_str = String::from_utf8_lossy(&rewritten);
-                        log::debug!(
-                            "SSDP Relay Response to client {}: \n{}",
-                            client_addr,
-                            data_str
-                        );
-
-                        let _ = relay_packet(
-                            &args,
-                            &interfaces,
-                            0,
-                            Some(src_ifindex),
-                            client_facing_ip,
-                            port,
-                            *client_addr.ip(),
-                            client_addr.port(),
-                            TTL_ID_OFFSET,
-                            0,
-                            &rewritten,
-                        );
                     }
-                }
-
-                continue;
-            }
-            Err(e) => {
-                log::error!("Error receiving: {}", e);
-                continue;
-            }
-        };
-
-        // Loop Prevention check
-        let rx_id = if args.ttl_id {
-            res.ttl.saturating_sub(TTL_ID_OFFSET)
-        } else {
-            res.tos >> 2
-        };
-
-        if args.ttl_id {
-            if res.ttl == args.id + TTL_ID_OFFSET {
-                log::trace!("TTL loop prevented: rx_ttl = {}, ID = {}", res.ttl, args.id);
-                continue;
-            }
-        } else {
-            if rx_id == args.id {
-                log::trace!(
-                    "DSCP loop prevented: rx_tos DSCP = {}, ID = {}",
-                    rx_id,
-                    args.id
-                );
-                continue;
-            }
-        }
-
-        // blockid check
-        if args.blockid.contains(&rx_id) {
-            log::trace!(
-                "BlockID loop prevented: rx_id = {}, blocked IDs = {:?}",
-                rx_id,
-                args.blockid
-            );
-            continue;
-        }
-
-        // Check if from managed interface
-        if !interfaces.contains_key(&res.ifindex) {
-            continue;
-        }
-
-        // Apply CIDR network filter rules
-        if !check_cidr_acl(
-            &acl_rules,
-            default_acl_action.clone(),
-            *res.src_addr.ip(),
-        ) {
-            log::trace!("Packet from {} blocked by CIDR ACL", res.src_addr.ip());
-            continue;
-        }
-
-        // Check for SSDP M-SEARCH requests
-        let mut is_msearch = false;
-        let mut msearch_act = MsearchAction::Forward;
-        let payload = &buf[..res.len];
-
-        if payload.starts_with(b"M-SEARCH * HTTP/1.1\r\n") {
-            is_msearch = true;
-            // Parse ST (Search Target)
-            let text = String::from_utf8_lossy(payload);
-            let mut matched_filter = None;
-            for line in text.split("\r\n") {
-                if line.to_ascii_lowercase().starts_with("st:") {
-                    let st_val = line.splitn(2, ':').nth(1).unwrap_or("").trim();
-                    matched_filter = msearch_filters.iter().find(|f| f.search_string == st_val);
-                    break;
-                }
-            }
-
-            msearch_act = if let Some(filter) = matched_filter {
-                filter.action.clone()
-            } else {
-                default_msearch_action.clone()
-            };
-            log::debug!("SSDP M-SEARCH query matched action: {:?}", msearch_act);
-        }
-
-        if is_msearch {
-            match msearch_act {
-                MsearchAction::Block => continue,
-                MsearchAction::Forward => {
-                    // Relay as normal UDP packet
-                    let _ = relay_packet(
-                        &args,
-                        &interfaces,
-                        res.ifindex,
-                        None,
-                        *res.src_addr.ip(),
-                        res.src_addr.port(),
-                        res.dst_ip,
-                        args.port,
-                        res.ttl,
-                        res.tos,
-                        payload,
-                    );
-                }
-                MsearchAction::Proxy | MsearchAction::Dial => {
-                    // SSDP proxy logic
-                    let mut proxies = msearch_proxies.lock().unwrap();
-                    let existing_port = proxies
-                        .iter()
-                        .find(|(_, p)| {
-                            p.client_addr == res.src_addr && p.src_ifindex == res.ifindex
-                        })
-                        .map(|(&port, _)| port);
-
-                    let proxy_port = if let Some(port) = existing_port {
-                        if let Some(p) = proxies.get_mut(&port) {
-                            p.last_active = Instant::now();
-                        }
-                        port
-                    } else {
-                        // Create dynamic UDP proxy socket
-                        match UdpSocket::bind("0.0.0.0:0") {
-                            Ok(sock) => {
-                                sock.set_nonblocking(true).unwrap();
-                                let port = sock.local_addr().unwrap().port();
-                                proxies.insert(
-                                    port,
-                                    MsearchProxyInfo {
-                                        sock,
-                                        client_addr: res.src_addr,
-                                        src_ifindex: res.ifindex,
-                                        action: msearch_act.clone(),
-                                        last_active: Instant::now(),
-                                    },
-                                );
+                    FdRole::TcpListener { port } => {
+                        if let Some(proxy_info) = tcp_proxies.get_mut(&port) {
+                            if let Ok((client_stream, _)) = proxy_info.listener.accept() {
                                 log::info!(
-                                    "Created dynamic SSDP proxy on port {} for client {}",
+                                    "TCP proxy accepted connection on port {} targeting {}",
                                     port,
-                                    res.src_addr
+                                    proxy_info.target_addr
                                 );
-                                port
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to create dynamic SSDP proxy: {}", e);
-                                0
+                                proxy_info.last_active = Instant::now();
+
+                                match TcpStream::connect(proxy_info.target_addr) {
+                                    Ok(server_stream) => {
+                                        client_stream.set_nonblocking(true).unwrap();
+                                        server_stream.set_nonblocking(true).unwrap();
+                                        let client_fd = client_stream.as_raw_fd();
+                                        let server_fd = server_stream.as_raw_fd();
+
+                                        active_tcp_connections.push(TcpProxyConnection {
+                                            client: client_stream,
+                                            server: server_stream,
+                                            client_fd,
+                                            server_fd,
+                                            target_addr: proxy_info.target_addr,
+                                            client_facing_ip: proxy_info.client_facing_ip,
+                                            last_active: Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "TCP proxy failed to connect to target {}: {}",
+                                            proxy_info.target_addr,
+                                            e
+                                        );
+                                    }
+                                }
                             }
                         }
-                    };
+                    }
+                    FdRole::TcpClient { conn_index } => {
+                        if conn_index < active_tcp_connections.len() {
+                            let conn = &mut active_tcp_connections[conn_index];
+                            conn.last_active = Instant::now();
+                            let mut tbuf = vec![0u8; 16384];
+                            match conn.client.read(&mut tbuf) {
+                                Ok(0) => {
+                                    closed_connections.insert(conn_index);
+                                }
+                                Ok(n) => {
+                                    // Rewrite Host header if HTTP request
+                                    let rewritten = replace_header_value(
+                                        &tbuf[..n],
+                                        "Host",
+                                        &format!("{}:{}", conn.target_addr.ip(), conn.target_addr.port()),
+                                    );
+                                    if let Err(e) = conn.server.write_all(&rewritten) {
+                                        log::warn!("TCP proxy write to server failed: {}", e);
+                                        closed_connections.insert(conn_index);
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(e) => {
+                                    log::warn!("TCP proxy read from client failed: {}", e);
+                                    closed_connections.insert(conn_index);
+                                }
+                            }
+                        }
+                    }
+                    FdRole::TcpServer { conn_index } => {
+                        if conn_index < active_tcp_connections.len() {
+                            let conn = &mut active_tcp_connections[conn_index];
+                            conn.last_active = Instant::now();
+                            let mut tbuf = vec![0u8; 16384];
+                            match conn.server.read(&mut tbuf) {
+                                Ok(0) => {
+                                    closed_connections.insert(conn_index);
+                                }
+                                Ok(n) => {
+                                    let mut rewritten = tbuf[..n].to_vec();
 
-                    if proxy_port != 0 {
-                        // Forward M-SEARCH query through target interfaces with rewritten source port
-                        let _ = relay_packet(
-                            &args,
-                            &interfaces,
-                            res.ifindex,
-                            None,
-                            *res.src_addr.ip(),
-                            proxy_port,
-                            res.dst_ip,
-                            args.port,
-                            res.ttl,
-                            res.tos,
-                            payload,
-                        );
+                                    // Check for Application-URL header
+                                    if let Some((app_ip, app_port)) =
+                                        extract_ip_port_from_header(&rewritten, "Application-URL")
+                                    {
+                                        let client_facing_ip = conn.client_facing_ip;
+                                        let existing = tcp_proxies.values().find(|p| {
+                                            p.target_addr == SocketAddrV4::new(app_ip, app_port)
+                                                && p.client_facing_ip == client_facing_ip
+                                        });
+
+                                        let port = if let Some(p) = existing {
+                                            p.listener.local_addr().unwrap().port()
+                                        } else {
+                                            match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0)) {
+                                                Ok(listener) => {
+                                                    let local_port = listener.local_addr().unwrap().port();
+                                                    listener.set_nonblocking(true).unwrap();
+                                                    tcp_proxies.insert(
+                                                        local_port,
+                                                        TcpProxyListenerInfo {
+                                                            listener,
+                                                            target_addr: SocketAddrV4::new(app_ip, app_port),
+                                                            client_facing_ip,
+                                                            last_active: Instant::now(),
+                                                        },
+                                                    );
+                                                    log::info!(
+                                                        "Created dynamic REST TCP proxy on port {} for target {}:{}",
+                                                        local_port,
+                                                        app_ip,
+                                                        app_port
+                                                    );
+                                                    local_port
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to create REST TCP proxy: {}", e);
+                                                    0
+                                                }
+                                            }
+                                        };
+
+                                        if port != 0 {
+                                            rewritten = replace_header_value(
+                                                &rewritten,
+                                                "Application-URL",
+                                                &format!("http://{}:{}/apps/", client_facing_ip, port),
+                                            );
+                                        }
+                                    }
+
+                                    // Check for Location header
+                                    if let Some((loc_ip, loc_port)) = extract_ip_port_from_header(&rewritten, "Location") {
+                                        let client_facing_ip = conn.client_facing_ip;
+                                        let existing = tcp_proxies.values().find(|p| {
+                                            p.target_addr == SocketAddrV4::new(loc_ip, loc_port)
+                                                && p.client_facing_ip == client_facing_ip
+                                        });
+
+                                        let port = if let Some(p) = existing {
+                                            p.listener.local_addr().unwrap().port()
+                                        } else {
+                                            match TcpListener::bind(SocketAddrV4::new(client_facing_ip, 0)) {
+                                                Ok(listener) => {
+                                                    let local_port = listener.local_addr().unwrap().port();
+                                                    listener.set_nonblocking(true).unwrap();
+                                                    tcp_proxies.insert(
+                                                        local_port,
+                                                        TcpProxyListenerInfo {
+                                                            listener,
+                                                            target_addr: SocketAddrV4::new(loc_ip, loc_port),
+                                                            client_facing_ip,
+                                                            last_active: Instant::now(),
+                                                        },
+                                                    );
+                                                    log::info!(
+                                                        "Created dynamic REST TCP proxy on port {} for target {}:{}",
+                                                        local_port,
+                                                        loc_ip,
+                                                        loc_port
+                                                    );
+                                                    local_port
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to create REST TCP proxy: {}", e);
+                                                    0
+                                                }
+                                            }
+                                        };
+
+                                        if port != 0 {
+                                            rewritten = replace_header_value(
+                                                &rewritten,
+                                                "Location",
+                                                &format!("http://{}:{}/", client_facing_ip, port),
+                                            );
+                                        }
+                                    }
+
+                                    if let Err(e) = conn.client.write_all(&rewritten) {
+                                        log::warn!("TCP proxy write to client failed: {}", e);
+                                        closed_connections.insert(conn_index);
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(e) => {
+                                    log::warn!("TCP proxy read from server failed: {}", e);
+                                    closed_connections.insert(conn_index);
+                                }
+                            }
+                        }
                     }
                 }
             }
-        } else {
-            // Relaying normal UDP packet
-            let _ = relay_packet(
-                &args,
-                &interfaces,
-                res.ifindex,
-                None,
-                *res.src_addr.ip(),
-                res.src_addr.port(),
-                res.dst_ip,
-                args.port,
-                res.ttl,
-                res.tos,
-                payload,
-            );
+        }
+
+        // Close and remove closed active TCP connections
+        if !closed_connections.is_empty() {
+            let mut sorted_indices: Vec<usize> = closed_connections.into_iter().collect();
+            sorted_indices.sort_by(|a, b| b.cmp(a));
+            for idx in sorted_indices {
+                if idx < active_tcp_connections.len() {
+                    log::info!("Closing and removing active TCP proxy connection");
+                    active_tcp_connections.remove(idx);
+                }
+            }
         }
     }
 
