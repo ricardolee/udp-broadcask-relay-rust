@@ -359,15 +359,14 @@ fn recv_with_ancillary(fd: RawFd, buf: &mut [u8]) -> Result<Option<RecvMsgResult
     };
 
     let mut control_buf = [0u8; 4096];
-    let mut msg = libc::msghdr {
-        msg_name: &mut src_addr as *mut _ as *mut libc::c_void,
-        msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: control_buf.as_mut_ptr() as *mut libc::c_void,
-        msg_controllen: control_buf.len(),
-        msg_flags: 0,
-    };
+    let mut msg: libc::msghdr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+    msg.msg_name = &mut src_addr as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = control_buf.len() as _;
+    msg.msg_flags = 0;
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
