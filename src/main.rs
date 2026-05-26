@@ -10,8 +10,10 @@ use pnet::packet::{MutablePacket, Packet};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 /// CLI Arguments structure.
 #[derive(Parser, Debug)]
@@ -131,6 +133,17 @@ fn main() -> Result<()> {
         }
     }
 
+    // Create an atomic flag to signal shutdown to all worker threads.
+    let running = Arc::new(AtomicBool::new(true));
+    let r = Arc::clone(&running);
+
+    // Set up Ctrl-C / SIGTERM signal handler.
+    ctrlc::set_handler(move || {
+        log::info!("Shutdown signal received. Shutting down gracefully...");
+        r.store(false, Ordering::SeqCst);
+    })
+    .context("Error setting Ctrl-C handler")?;
+
     log::info!("UDP broadcast relay starting (ID: {}, Port: {})", args.id, args.port);
 
     let mut threads = Vec::new();
@@ -139,12 +152,19 @@ fn main() -> Result<()> {
     for (&ifindex, _info) in interfaces.iter() {
         let args = Arc::clone(&args);
         let interfaces = Arc::clone(&interfaces);
+        let running = Arc::clone(&running);
         
         threads.push(thread::spawn(move || {
             let iface = &interfaces[&ifindex].iface;
             
+            // Set up a datalink channel with a read timeout to allow checking the shutdown flag periodically.
+            let config = datalink::Config {
+                read_timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            };
+
             // Listen for incoming Ethernet packets on the data link layer.
-            let (_, mut rx) = match datalink::channel(iface, Default::default()) {
+            let (_, mut rx) = match datalink::channel(iface, config) {
                 Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
                 _ => {
                     log::error!("Failed to create datalink channel for {}", iface.name);
@@ -155,9 +175,19 @@ fn main() -> Result<()> {
             log::info!("Listening on {}", iface.name);
 
             loop {
+                // Periodically check if the shutdown flag has been set to exit the loop cleanly.
+                if !running.load(Ordering::SeqCst) {
+                    log::info!("Stopped listening on {}", iface.name);
+                    break;
+                }
+
                 let packet = match rx.next() {
                     Ok(packet) => packet,
                     Err(e) => {
+                        // Skip timeouts or would-block errors as they are expected due to the read_timeout config.
+                        if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
                         log::error!("Error receiving on {}: {}", iface.name, e);
                         continue;
                     }
@@ -182,10 +212,12 @@ fn main() -> Result<()> {
         }));
     }
 
+    // Wait for all worker threads to exit cleanly before termination.
     for t in threads {
         t.join().unwrap();
     }
 
+    log::info!("All worker threads stopped. Clean exit.");
     Ok(())
 }
 
