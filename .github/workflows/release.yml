@@ -42,9 +42,14 @@ jobs:
 
       - name: Update version in Cargo.toml
         run: |
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          echo "Updating Cargo.toml version to: ${VERSION}"
-          sed -i '0,/^version[[:space:]]*=/s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"$VERSION"'"/' Cargo.toml
+          REF_NAME="${{ github.ref_name }}"
+          VERSION=$(echo "$REF_NAME" | sed 's/^v//')
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
+            echo "Updating Cargo.toml version to: ${VERSION}"
+            sed -i '0,/^version[[:space:]]*=/s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"$VERSION"'"/' Cargo.toml
+          else
+            echo "Ref '${REF_NAME}' is not a semver tag; keeping Cargo.toml version unchanged."
+          fi
           cat Cargo.toml
 
       - name: Install Rust toolchain
