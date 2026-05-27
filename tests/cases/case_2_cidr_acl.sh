@@ -30,7 +30,9 @@ except socket.timeout:
 " &
 PY_PID=$!
 sleep 0.5
-ip addr add 192.168.10.2/24 dev veth1-peer || true
+if ! ip -o -4 addr show dev veth1-peer | grep -qw '192.168.10.2/24'; then
+    ip addr add 192.168.10.2/24 dev veth1-peer
+fi
 python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -58,7 +60,9 @@ except socket.timeout:
 " &
 PY_PID=$!
 sleep 0.5
-ip addr add 192.168.10.100/24 dev veth1-peer || true
+if ! ip -o -4 addr show dev veth1-peer | grep -qw '192.168.10.100/24'; then
+    ip addr add 192.168.10.100/24 dev veth1-peer
+fi
 python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -69,7 +73,9 @@ s.sendto(b'BLOCK-TEST', ('192.168.10.255', 5555))
 wait $PY_PID || true
 kill $RELAY_PID || true
 wait $RELAY_PID || true
-ip addr del 192.168.10.100/24 dev veth1-peer || true
+if ip -o -4 addr show dev veth1-peer | grep -qw '192.168.10.100/24'; then
+    ip addr del 192.168.10.100/24 dev veth1-peer
+fi
 
 if [ -f "$TEST_DIR/received_t2_allow.txt" ] && [ ! -f "$TEST_DIR/received_t2_block.txt" ]; then
     echo "SUCCESS: Test Case 2 (Longest Prefix Match block in allow) worked!"
